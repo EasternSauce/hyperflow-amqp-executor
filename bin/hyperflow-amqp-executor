@@ -1,0 +1,56 @@
+#!/usr/bin/env ruby
+require_relative '../lib/hyperflow-amqp-executor'
+
+include Executor
+
+task_queue_name = (ENV['AMQP_QUEUE'] or "hyperflow.jobs")
+
+Executor::id = SecureRandom.uuid
+Executor::logger.info "Starting worker #{Executor.id}"
+
+Executor::settings = Executor::Settings.load(ARGV.first)
+
+Executor::logger.info "Running #{Executor::settings.threads} worker threads"
+EM.threadpool_size = Executor::settings.threads
+
+EM.run do
+  AMQP.connect(Executor::settings.amqp_url) do |connection|
+    Executor::logger.info "Connected to AMQP broker... "
+
+    channel  = AMQP::Channel.new(connection)
+    channel.prefetch(Executor::settings.threads)
+
+    Executor::events_exchange = channel.topic('hyperflow.events', durable: true)
+    queue = channel.queue(task_queue_name,   durable: true)
+
+    queue.subscribe(ack: true) do |header, payload|
+      begin
+        job_data = RecursiveOpenStruct.new(JSON.parse(payload), recurse_over_arrays: true)
+        job = Job.new(header.correlation_id, job_data)
+        op = -> {
+          begin
+            job.run
+          rescue Exception => e
+            Executor::logger.error "[#{header.correlation_id}] Error running job: #{e}"
+            Executor::logger.debug "[#{header.correlation_id}] Backtrace\n#{e.backtrace.join("\n")}"
+            {exit_status: -2, exceptions: [e]}
+          end
+        }
+        cb = ->(output){
+          channel.default_exchange.publish(JSON.dump(output), content_type: 'application/json', routing_key: header.reply_to, correlation_id: header.correlation_id, mandatory: true)
+          header.ack
+        }
+        EM.defer(op, cb)
+      rescue JSON::ParserError
+        Executor::logger.error "[#{header.correlation_id}] Invalid JSON"
+        header.ack
+      end
+    end
+
+    Executor::publish_event('executor.ready', 'executor.ready', hostname: `hostname -f`)
+
+    Signal.trap("INT") {
+      connection.close { EM.stop }
+    }
+  end
+end
